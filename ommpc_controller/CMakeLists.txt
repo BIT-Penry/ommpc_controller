@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   dynamic_reconfigure
+  traj_utils
 )
 
 find_package(Eigen3 REQUIRED)
@@ -25,6 +26,7 @@ catkin_package(
  INCLUDE_DIRS include
 #  LIBRARIES ommpc_controller
 #  CATKIN_DEPENDS geometry_msgs nav_msgs quadrotor_msgs roscpp rospy std_msgs tf airsim_ros_pkgs
+  CATKIN_DEPENDS dynamic_reconfigure geometry_msgs mavros nav_msgs roscpp rospy sensor_msgs std_msgs traj_utils
 #  DEPENDS system_lib
 )
 
@@ -36,6 +38,11 @@ include_directories(
 
 add_executable(${PROJECT_NAME}_example_node 
   src/ommpc_example.cpp
+)
+
+add_dependencies(${PROJECT_NAME}_example_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
 )
 
 target_link_libraries(${PROJECT_NAME}_example_node

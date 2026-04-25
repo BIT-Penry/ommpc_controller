@@ -3,6 +3,7 @@
 #include <mavros_msgs/SetMode.h>
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/AttitudeTarget.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Float64.h>
 #include <dynamic_reconfigure/server.h>
 
@@ -24,7 +25,7 @@ enum Exec_Traj_State_t
 class OMMPC_EXAMPLE{
 private:
     ros::NodeHandle node_;
-    ros::Publisher cmd_pub_;
+    ros::Publisher cmd_pub_, prearm_pos_pub_;
     ros::Subscriber odom_sub_, imu_sub_, state_sub_, mpc_traj_sub_, hover_yaw_sub_;
     ros::ServiceClient set_mode_client_, arming_client_srv_;
     ros::Timer exec_timer_, read_file_timer_;
@@ -39,7 +40,14 @@ private:
     bool is_command_mode_ = false;
     bool takeoff_enabled_ = false, last_takeoff_enabled_ = false, takeoff_trigger_ = false;
     bool land_enabled_ = false, last_land_enabled_ = false, land_trigger_ = false;
+    bool send_attitude_cmd_this_cycle_ = true;
+    int offboard_setpoint_counter_ = 0;
+    bool offboard_sequence_active_ = false;
+    const int offboard_prestream_setpoint_count_ = 100;
+    const double odom_timeout_sec_ = 0.2;
+    const double request_interval_sec_ = 5.0;
     double start_takeoff_land_time;
+    ros::Time last_request_time_;
     bool enu_frame_, vel_in_body_;
     Eigen::Vector4d hover_pose_;
 
@@ -90,6 +98,124 @@ private:
         cmd_pub_.publish(cmd);
     }
 
+    void reset_offboard_takeoff_sequence()
+    {
+        offboard_setpoint_counter_ = 0;
+        offboard_sequence_active_ = false;
+        last_request_time_ = ros::Time(0);
+    }
+
+    void publish_offboard_position_setpoint() {
+        geometry_msgs::PoseStamped pose;
+        pose.header.stamp = ros::Time::now();
+        pose.header.frame_id = "map";
+        pose.pose.position.x = odom_data_.p(0);
+        pose.pose.position.y = odom_data_.p(1);
+        pose.pose.position.z = param_.takeoff_height;
+        pose.pose.orientation.w = 1.0;
+        prearm_pos_pub_.publish(pose);
+    }
+
+    bool has_fresh_odom() const
+    {
+        if (!odom_data_.recv_new_msg)
+            return false;
+
+        return (ros::Time::now() - odom_data_.rcv_stamp).toSec() < odom_timeout_sec_;
+    }
+
+    void enter_takeoff_state(const char *log_msg)
+    {
+        start_takeoff_land_time = ros::Time::now().toSec();
+        set_hov_with_odom();
+        exec_traj_state_ = TAKEOFF;
+        reset_offboard_takeoff_sequence();
+        ROS_INFO("%s", log_msg);
+    }
+
+    bool request_offboard_mode()
+    {
+        mavros_msgs::SetMode offb_set_mode;
+        offb_set_mode.request.custom_mode = "OFFBOARD";
+        if (set_mode_client_.call(offb_set_mode) && offb_set_mode.response.mode_sent)
+        {
+            ROS_INFO("[MPCctrl] OFFBOARD enabled");
+            return true;
+        }
+
+        ROS_WARN("[MPCctrl] OFFBOARD request rejected by PX4, will keep streaming setpoints.");
+        return false;
+    }
+
+    void start_offboard_sequence_if_needed()
+    {
+        if (offboard_sequence_active_)
+            return;
+
+        offboard_sequence_active_ = true;
+        offboard_setpoint_counter_ = 0;
+        last_request_time_ = ros::Time::now();
+        ROS_INFO("[MPCctrl] Start OFFBOARD prestream via /mavros/setpoint_position/local following PX4 MAVROS example.");
+    }
+
+    bool handle_takeoff_offboard_sequence(Controller_Output_t &output)
+    {
+        (void)output;
+        send_attitude_cmd_this_cycle_ = false;
+
+        if (!has_fresh_odom())
+        {
+            reset_offboard_takeoff_sequence();
+            ROS_WARN_THROTTLE(1.0, "[MPCctrl] Waiting for fresh odom before OFFBOARD/arm.");
+            return true;
+        }
+
+        start_offboard_sequence_if_needed();
+        ++offboard_setpoint_counter_;
+        publish_offboard_position_setpoint();
+
+        if (state_.armed)
+        {
+            enter_takeoff_state("[MPCctrl] Vehicle already armed. HOVER --> TAKEOFF");
+            return true;
+        }
+
+        if (offboard_setpoint_counter_ < offboard_prestream_setpoint_count_)
+        {
+            ROS_INFO_THROTTLE(1.0,
+                              "[MPCctrl] Prestreaming OFFBOARD position setpoints (%d/%d), mode=%s",
+                              offboard_setpoint_counter_,
+                              offboard_prestream_setpoint_count_,
+                              state_.mode.c_str());
+            return true;
+        }
+
+        const ros::Time now = ros::Time::now();
+        if ((now - last_request_time_) < ros::Duration(request_interval_sec_))
+        {
+            ROS_INFO_THROTTLE(1.0,
+                              "[MPCctrl] Waiting before next OFFBOARD/arm request. mode=%s armed=%s",
+                              state_.mode.c_str(),
+                              state_.armed ? "true" : "false");
+            return true;
+        }
+
+        if (state_.mode != mavros_msgs::State::MODE_PX4_OFFBOARD)
+        {
+            request_offboard_mode();
+            last_request_time_ = now;
+            return true;
+        }
+
+        if (toggle_arm_disarm(true))
+        {
+            enter_takeoff_state("[MPCctrl] OFFBOARD active and arm accepted. HOVER --> TAKEOFF");
+        }
+        last_request_time_ = now;
+
+        return true;
+    }
+
     void set_hov_with_odom()
     {
         hover_pose_.head<3>() = odom_data_.p;
@@ -115,7 +241,7 @@ private:
         if (!(arming_client_srv_.call(arm_cmd) && arm_cmd.response.success))
         {
             if (arm)
-                ROS_ERROR("ARM rejected by PX4!");
+                ROS_WARN("ARM rejected by PX4, will retry while streaming setpoints.");
             else
                 ROS_ERROR("DISARM rejected by PX4!");
 
@@ -131,6 +257,7 @@ private:
         Controller_Output_t u;
         bool ret;
         ros::Time now_time = ros::Time::now();
+        send_attitude_cmd_this_cycle_ = true;
         // std::cout << "exec_traj_state_:" << exec_traj_state_ << std::endl;
         // std::cout << "traj_queue size:" << trajectory_data_.traj_queue.size() << std::endl;
         // std::cout << "now_time" << now_time << std::endl;
@@ -141,19 +268,13 @@ private:
         {
         case HOVER:
         {
-            if (takeoff_trigger_ && state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD)
+            if (takeoff_trigger_)
             {
-                start_takeoff_land_time = ros::Time::now().toSec();
-                if (toggle_arm_disarm(true))
-                {
-                    set_hov_with_odom();
-                    exec_traj_state_ = TAKEOFF;
-                    ROS_INFO("[MPCctrl] Receive the trajectory. HOVER --> TAKEOFF");
-                }
-                ret = true;
+                ret = handle_takeoff_offboard_sequence(u);
             }
             else if (land_trigger_ && state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD)
             {
+                reset_offboard_takeoff_sequence();
                 start_takeoff_land_time = ros::Time::now().toSec();
                 set_hov_with_odom();
                 ret = true;
@@ -165,6 +286,7 @@ private:
                 trajectory_data_.exec_traj == 1 && (!trajectory_data_.traj_queue.empty())
                 && is_command_mode_ && state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD)
             {
+                reset_offboard_takeoff_sequence();
                 // same as the below
                 set_hov_with_odom();
                 oneTraj_Data_t *traj_info = &trajectory_data_.traj_queue.front();
@@ -179,6 +301,7 @@ private:
             }
             else if (param_.use_ref_txt && is_command_mode_ && state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD)
             {
+                reset_offboard_takeoff_sequence();
                 exec_traj_state_ = POINTS;
                 ROS_INFO("[MPCctrl] Start executing traj from txt. HOVER --> POINTS");
                 // same as the below
@@ -189,6 +312,7 @@ private:
             }
             else
             {
+                reset_offboard_takeoff_sequence();
                 ommpc_controller_.setHoverReference(hover_pose_);
                 ret = ommpc_controller_.execMPC(odom_data_, u);
             }
@@ -284,7 +408,7 @@ private:
                                     hover_pose_(1),
                                     altitude);
                 quad_velocities_[i] = Eigen::Vector3d(0.0, 0.0, param_.takeoff_land_speed);
-                yaws_[i] = hover_pose_(4);
+                yaws_[i] = hover_pose_(3);
             }
             double yaw_now = get_yaw_from_quaternion(odom_data_.q);
             ommpc_controller_.setTextReference(quad_positions_, quad_velocities_, odom_data_, yaw_now, yaws_);
@@ -314,7 +438,7 @@ private:
                                     hover_pose_(1),
                                     altitude);
                 quad_velocities_[i] = Eigen::Vector3d(0.0, 0.0, -param_.takeoff_land_speed);
-                yaws_[i] = hover_pose_(4);
+                yaws_[i] = hover_pose_(3);
             }
             double yaw_now = get_yaw_from_quaternion(odom_data_.q);
             ommpc_controller_.setTextReference(quad_positions_, quad_velocities_, odom_data_, yaw_now, yaws_);
@@ -346,14 +470,14 @@ private:
         break;
         }
 
-        if (ret)
-        {
-            send_cmd(u);
-        }
-        else
+        if (!ret)
         {
             exec_traj_state_ = HOVER;
             ROS_ERROR("[MPCctrl] Numerical error!");
+        }
+        else if (send_attitude_cmd_this_cycle_)
+        {
+            send_cmd(u);
         }
         
         if(state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD &&
@@ -448,15 +572,21 @@ public:
     OMMPC_EXAMPLE(/* args */){};
     ~OMMPC_EXAMPLE(){};
     void init(ros::NodeHandle &nh){
+        std::string odom_topic;
+
         enu_frame_ = true;
         // for real world flight, vel_in_body should be set to false!
         vel_in_body_ = false;
         exec_traj_state_ = HOVER;
+        nh.param<std::string>("odom_topic",
+                              odom_topic,
+                              "/some_object_name_vrpn_client/estimated_odometry");
 
         cmd_pub_ = nh.advertise<mavros_msgs::AttitudeTarget>("/mavros/setpoint_raw/attitude", 10);
+        prearm_pos_pub_ = nh.advertise<geometry_msgs::PoseStamped>("/mavros/setpoint_position/local", 10);
         set_mode_client_ = nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
         arming_client_srv_ = nh.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
-        odom_sub_ = nh.subscribe<nav_msgs::Odometry>("/some_object_name_vrpn_client/estimated_odometry", 10, &OMMPC_EXAMPLE::OdomCallback, this);
+        odom_sub_ = nh.subscribe<nav_msgs::Odometry>(odom_topic, 10, &OMMPC_EXAMPLE::OdomCallback, this);
         imu_sub_ = nh.subscribe<sensor_msgs::Imu>("/mavros/imu/data", 10, &OMMPC_EXAMPLE::IMUCallback, this);
         state_sub_ = nh.subscribe<mavros_msgs::State>("/mavros/state", 10, &OMMPC_EXAMPLE::StateCallback, this);
         hover_yaw_sub_ = nh.subscribe<std_msgs::Float64>("/drone_0_planning/hover_yaw", 1,
@@ -466,6 +596,8 @@ public:
                                         boost::bind(&Trajectory_Data_t::feed_from_traj_utils, &trajectory_data_, _1),
                                         ros::VoidConstPtr(),
                                         ros::TransportHints().tcpNoDelay());
+
+        ROS_INFO_STREAM("[MPCctrl] Subscribing odom topic: " << odom_topic);
 
         int trials = 0;
         while (ros::ok() && !state_.connected)
@@ -520,6 +652,7 @@ public:
         ommpc_controller_.init(param_);
 
         hover_pose_ << 0, 0, 0.0, 0;
+        ROS_INFO("[MPCctrl] Using PX4 MAVROS offboard sequence: prestream position setpoints, request OFFBOARD, then arm.");
 
         exec_timer_ = nh.createTimer(ros::Duration(0.01), &OMMPC_EXAMPLE::execFSMCallback, this);
     }
