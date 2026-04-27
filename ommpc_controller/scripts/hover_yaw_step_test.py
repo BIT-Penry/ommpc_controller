@@ -65,8 +65,14 @@ class HoverYawStepTest:
         self.targets_deg = _parse_targets_deg(
             rospy.get_param("~targets_deg", [60, 120, 180, 240, 300, 360])
         )
-        self.dwell_time = float(rospy.get_param("~dwell_time", 6.0))
+        self.dwell_time = float(rospy.get_param("~dwell_time", 10.0))
         self.start_delay = float(rospy.get_param("~start_delay", 2.0))
+        self.mode = str(rospy.get_param("~mode", "ramp")).strip().lower()
+        if self.mode not in ("step", "ramp"):
+            rospy.logwarn("[hover_yaw_step_test] Unknown mode=%s, falling back to ramp.", self.mode)
+            self.mode = "ramp"
+        self.pub_hz = float(rospy.get_param("~pub_hz", 20.0))
+        self.max_yaw_rate_deg_s = float(rospy.get_param("~max_yaw_rate_deg_s", 15.0))
         self.command_repeat = int(rospy.get_param("~command_repeat", 3))
         self.command_repeat_dt = float(rospy.get_param("~command_repeat_dt", 0.1))
         self.settle_tail_s = float(rospy.get_param("~settle_tail_s", 1.0))
@@ -83,8 +89,12 @@ class HoverYawStepTest:
         self.active_segment = -1
         self.active_target_rad = None
         self.active_target_deg = None
+        self.active_goal_rad = None
+        self.active_goal_deg = None
+        self.active_ref_yaw_rate_rad_s = 0.0
         self.active_segment_start_stamp = None
         self.active_segment_start_pos = None
+        self.ref_yaw_unwrapped_rad = None
         self.last_yaw = None
         self.last_yaw_stamp = None
         self.last_yaw_unwrapped = None
@@ -104,9 +114,11 @@ class HoverYawStepTest:
         rospy.loginfo("[hover_yaw_step_test] yaw_topic=%s", self.yaw_topic)
         rospy.loginfo("[hover_yaw_step_test] odom_topic=%s", self.odom_topic)
         rospy.loginfo(
-            "[hover_yaw_step_test] targets_deg=%s dwell=%.2fs output=%s",
+            "[hover_yaw_step_test] targets_deg=%s mode=%s dwell=%.2fs max_yaw_rate=%.1fdeg/s output=%s",
             self.targets_deg,
+            self.mode,
             self.dwell_time,
+            self.max_yaw_rate_deg_s,
             self.out_dir,
         )
 
@@ -148,6 +160,10 @@ class HoverYawStepTest:
             "segment_id": self.active_segment,
             "target_yaw_deg": self.active_target_deg,
             "target_yaw_rad": self.active_target_rad,
+            "goal_yaw_deg": self.active_goal_deg,
+            "goal_yaw_rad": self.active_goal_rad,
+            "target_yaw_rate_deg_s": math.degrees(self.active_ref_yaw_rate_rad_s),
+            "target_yaw_rate_rad_s": self.active_ref_yaw_rate_rad_s,
             "actual_yaw_deg": math.degrees(yaw),
             "actual_yaw_rad": yaw,
             "actual_yaw_unwrapped_deg": math.degrees(self.last_yaw_unwrapped),
@@ -155,6 +171,8 @@ class HoverYawStepTest:
             "yaw_error_rad": yaw_err,
             "actual_yaw_rate_deg_s": math.degrees(yaw_rate),
             "actual_yaw_rate_rad_s": yaw_rate,
+            "yaw_rate_error_deg_s": math.degrees(self.active_ref_yaw_rate_rad_s - yaw_rate),
+            "yaw_rate_error_rad_s": self.active_ref_yaw_rate_rad_s - yaw_rate,
             "actual_x": p.x,
             "actual_y": p.y,
             "actual_z": p.z,
@@ -169,57 +187,117 @@ class HoverYawStepTest:
             rate.sleep()
         rospy.loginfo("[hover_yaw_step_test] Odom ready.")
 
-    def _publish_target(self, segment_id, target_deg):
+    def _publish_ref(self, segment_id, ref_rad, ref_rate_rad_s, publish_log=False):
+        self.active_target_rad = ref_rad
+        self.active_target_deg = math.degrees(ref_rad)
+        self.active_ref_yaw_rate_rad_s = ref_rate_rad_s
+        self.pub.publish(Float64(data=ref_rad))
+
+        if publish_log:
+            now = rospy.Time.now().to_sec()
+            self.commands.append({
+                "stamp_s": now,
+                "test_t_s": now - self.test_start_stamp,
+                "segment_id": int(segment_id),
+                "mode": self.mode,
+                "target_yaw_deg": self.active_target_deg,
+                "target_yaw_rad": ref_rad,
+                "target_yaw_rate_deg_s": math.degrees(ref_rate_rad_s),
+                "target_yaw_rate_rad_s": ref_rate_rad_s,
+                "goal_yaw_deg": self.active_goal_deg,
+                "goal_yaw_rad": self.active_goal_rad,
+                "start_x": self.active_segment_start_pos[0],
+                "start_y": self.active_segment_start_pos[1],
+                "start_z": self.active_segment_start_pos[2],
+            })
+
+    def _start_segment(self, segment_id, target_deg):
         target_rad = math.radians(target_deg)
         now = rospy.Time.now().to_sec()
         odom = self.latest_odom
         p = odom.pose.pose.position
 
         self.active_segment = int(segment_id)
-        self.active_target_deg = float(target_deg)
-        self.active_target_rad = target_rad
+        self.active_goal_deg = float(target_deg)
+        self.active_goal_rad = target_rad
         self.active_segment_start_stamp = now
         self.active_segment_start_pos = (p.x, p.y, p.z)
 
-        self.commands.append({
-            "stamp_s": now,
-            "test_t_s": now - self.test_start_stamp,
-            "segment_id": int(segment_id),
-            "target_yaw_deg": float(target_deg),
-            "target_yaw_rad": target_rad,
-            "start_x": p.x,
-            "start_y": p.y,
-            "start_z": p.z,
-        })
+        if self.ref_yaw_unwrapped_rad is None:
+            self.ref_yaw_unwrapped_rad = self.last_yaw_unwrapped
 
-        msg = Float64(data=target_rad)
-        for _ in range(max(1, self.command_repeat)):
-            self.pub.publish(msg)
-            rospy.sleep(self.command_repeat_dt)
+        if self.mode == "step":
+            self.ref_yaw_unwrapped_rad = target_rad
+            self._publish_ref(segment_id, target_rad, 0.0, publish_log=True)
+            msg = Float64(data=target_rad)
+            for _ in range(max(0, self.command_repeat - 1)):
+                rospy.sleep(self.command_repeat_dt)
+                self.pub.publish(msg)
+        else:
+            self._publish_ref(segment_id, self.ref_yaw_unwrapped_rad, 0.0, publish_log=True)
 
         rospy.loginfo(
-            "[hover_yaw_step_test] Segment %d target %.1f deg published.",
+            "[hover_yaw_step_test] Segment %d goal %.1f deg started.",
             segment_id,
             target_deg,
         )
+
+    def _run_ramp_segment(self, segment_id, target_deg):
+        self._start_segment(segment_id, target_deg)
+        rate = rospy.Rate(max(1.0, self.pub_hz))
+        max_rate = math.radians(max(0.1, self.max_yaw_rate_deg_s))
+        hold_end_time = None
+        last_t = rospy.Time.now().to_sec()
+
+        while not rospy.is_shutdown():
+            now = rospy.Time.now().to_sec()
+            dt = max(1.0e-3, now - last_t)
+            last_t = now
+
+            remaining = self.active_goal_rad - self.ref_yaw_unwrapped_rad
+            if abs(remaining) <= max_rate * dt:
+                self.ref_yaw_unwrapped_rad = self.active_goal_rad
+                ref_rate = 0.0
+                if hold_end_time is None:
+                    hold_end_time = now + self.dwell_time
+            else:
+                direction = 1.0 if remaining > 0.0 else -1.0
+                self.ref_yaw_unwrapped_rad += direction * max_rate * dt
+                ref_rate = direction * max_rate
+
+            self._publish_ref(segment_id, self.ref_yaw_unwrapped_rad, ref_rate, publish_log=True)
+
+            if hold_end_time is not None and now >= hold_end_time:
+                break
+            rate.sleep()
+
+    def _run_step_segment(self, segment_id, target_deg):
+        self._start_segment(segment_id, target_deg)
+        end_time = rospy.Time.now().to_sec() + self.dwell_time
+        rate = rospy.Rate(20.0)
+        while not rospy.is_shutdown() and rospy.Time.now().to_sec() < end_time:
+            rate.sleep()
 
     def run(self):
         self._wait_for_odom()
         rospy.sleep(self.start_delay)
         self.test_start_stamp = rospy.Time.now().to_sec()
+        self.ref_yaw_unwrapped_rad = self.last_yaw_unwrapped
 
         for idx, target_deg in enumerate(self.targets_deg):
             if rospy.is_shutdown():
                 break
-            self._publish_target(idx, target_deg)
-            end_time = rospy.Time.now().to_sec() + self.dwell_time
-            rate = rospy.Rate(20.0)
-            while not rospy.is_shutdown() and rospy.Time.now().to_sec() < end_time:
-                rate.sleep()
+            if self.mode == "step":
+                self._run_step_segment(idx, target_deg)
+            else:
+                self._run_ramp_segment(idx, target_deg)
 
         self.active_segment = -1
         self.active_target_rad = None
         self.active_target_deg = None
+        self.active_goal_rad = None
+        self.active_goal_deg = None
+        self.active_ref_yaw_rate_rad_s = 0.0
         self.save()
         rospy.loginfo("[hover_yaw_step_test] Done.")
 
@@ -257,6 +335,9 @@ class HoverYawStepTest:
         lines.append("yaw_topic: %s" % self.yaw_topic)
         lines.append("odom_topic: %s" % self.odom_topic)
         lines.append("targets_deg: %s" % ", ".join("%.1f" % v for v in self.targets_deg))
+        lines.append("mode: %s" % self.mode)
+        lines.append("pub_hz: %.3f" % self.pub_hz)
+        lines.append("max_yaw_rate_deg_s: %.3f" % self.max_yaw_rate_deg_s)
         lines.append("dwell_time_s: %.3f" % self.dwell_time)
         lines.append("start_delay_s: %.3f" % self.start_delay)
         lines.append("settle_threshold_deg: %.3f" % self.settle_threshold_deg)
@@ -268,6 +349,7 @@ class HoverYawStepTest:
         for idx, target_deg in enumerate(self.targets_deg):
             rows = self._segment_rows(idx)
             yaw_stats = _series_stats([r["yaw_error_deg"] for r in rows])
+            yaw_rate_err_stats = _series_stats([r["yaw_rate_error_deg_s"] for r in rows])
             yaw_rate_stats = _series_stats([r["actual_yaw_rate_deg_s"] for r in rows])
             drift_xy_stats = _series_stats([r["drift_xy_m"] for r in rows])
             drift_z_stats = _series_stats([r["drift_z_m"] for r in rows])
@@ -297,6 +379,10 @@ class HoverYawStepTest:
                 % (yaw_rate_stats["mean"], yaw_rate_stats["rmse"], yaw_rate_stats["max_abs"])
             )
             lines.append(
+                "yaw_rate_error_deg_s: mean=%.4f rmse=%.4f max_abs=%.4f"
+                % (yaw_rate_err_stats["mean"], yaw_rate_err_stats["rmse"], yaw_rate_err_stats["max_abs"])
+            )
+            lines.append(
                 "drift_xy_m: mean=%.4f rmse=%.4f max_abs=%.4f"
                 % (drift_xy_stats["mean"], drift_xy_stats["rmse"], drift_xy_stats["max_abs"])
             )
@@ -318,20 +404,25 @@ class HoverYawStepTest:
 
         t = [r["test_t_s"] for r in self.samples]
         target = [r["target_yaw_deg"] for r in self.samples]
+        target_rate = [r["target_yaw_rate_deg_s"] for r in self.samples]
         actual = [r["actual_yaw_deg"] for r in self.samples]
         actual_unwrapped = [r["actual_yaw_unwrapped_deg"] for r in self.samples]
         error = [r["yaw_error_deg"] for r in self.samples]
         yaw_rate = [r["actual_yaw_rate_deg_s"] for r in self.samples]
+        yaw_rate_error = [r["yaw_rate_error_deg_s"] for r in self.samples]
         drift_xy = [r["drift_xy_m"] for r in self.samples]
         drift_z = [r["drift_z_m"] for r in self.samples]
 
         fig = plt.figure(figsize=(14, 9))
 
         ax1 = fig.add_subplot(2, 2, 1)
-        ax1.step(t, target, where="post", label="target yaw", linewidth=2.0)
+        if self.mode == "step":
+            ax1.step(t, target, where="post", label="target yaw", linewidth=2.0)
+        else:
+            ax1.plot(t, target, label="target yaw", linewidth=2.0)
         ax1.plot(t, actual, label="actual yaw wrapped", linewidth=1.2)
         ax1.plot(t, actual_unwrapped, label="actual yaw unwrapped", linewidth=1.2, alpha=0.75)
-        ax1.set_title("Yaw Step Response")
+        ax1.set_title("Yaw Reference Response")
         ax1.set_xlabel("t [s]")
         ax1.set_ylabel("yaw [deg]")
         ax1.grid(True)
@@ -348,7 +439,9 @@ class HoverYawStepTest:
         ax2.legend()
 
         ax3 = fig.add_subplot(2, 2, 3)
+        ax3.plot(t, target_rate, label="target yaw rate", linewidth=1.2)
         ax3.plot(t, yaw_rate, label="actual yaw rate", linewidth=1.5)
+        ax3.plot(t, yaw_rate_error, label="yaw rate error", linewidth=1.0, alpha=0.75)
         ax3.set_title("Yaw Rate")
         ax3.set_xlabel("t [s]")
         ax3.set_ylabel("yaw rate [deg/s]")
@@ -377,7 +470,21 @@ class HoverYawStepTest:
             self._write_csv(
                 self.commands_csv_path,
                 self.commands,
-                ["stamp_s", "test_t_s", "segment_id", "target_yaw_deg", "target_yaw_rad", "start_x", "start_y", "start_z"],
+                [
+                    "stamp_s",
+                    "test_t_s",
+                    "segment_id",
+                    "mode",
+                    "target_yaw_deg",
+                    "target_yaw_rad",
+                    "target_yaw_rate_deg_s",
+                    "target_yaw_rate_rad_s",
+                    "goal_yaw_deg",
+                    "goal_yaw_rad",
+                    "start_x",
+                    "start_y",
+                    "start_z",
+                ],
             )
         if self.samples:
             self._write_csv(
@@ -390,6 +497,10 @@ class HoverYawStepTest:
                     "segment_id",
                     "target_yaw_deg",
                     "target_yaw_rad",
+                    "goal_yaw_deg",
+                    "goal_yaw_rad",
+                    "target_yaw_rate_deg_s",
+                    "target_yaw_rate_rad_s",
                     "actual_yaw_deg",
                     "actual_yaw_rad",
                     "actual_yaw_unwrapped_deg",
@@ -397,6 +508,8 @@ class HoverYawStepTest:
                     "yaw_error_rad",
                     "actual_yaw_rate_deg_s",
                     "actual_yaw_rate_rad_s",
+                    "yaw_rate_error_deg_s",
+                    "yaw_rate_error_rad_s",
                     "actual_x",
                     "actual_y",
                     "actual_z",

@@ -242,7 +242,8 @@ private:
     }
 
     void HoverYawCallback(const std_msgs::Float64::ConstPtr &msg) {
-        hover_pose_.head<3>() = odom_data_.p;
+        if (exec_traj_state_ != HOVER)
+            hover_pose_.head<3>() = odom_data_.p;
         hover_pose_(3) = msg->data;
         trajectory_data_.exec_traj = 0;
         exec_traj_state_ = HOVER;
