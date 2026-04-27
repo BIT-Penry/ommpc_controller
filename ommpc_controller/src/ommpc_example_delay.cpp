@@ -13,6 +13,7 @@
 
 #include <ros/package.h>
 #include <fstream>
+#include <random>
 
 enum Exec_Traj_State_t
 {
@@ -47,10 +48,15 @@ private:
     const int offboard_prestream_setpoint_count_ = 100;
     const double odom_timeout_sec_ = 0.2;
     const double request_interval_sec_ = 5.0;
+    const double command_delay_min_sec_ = 0.001;
+    const double command_delay_mean_sec_ = 0.015;
+    const double command_delay_max_sec_ = 0.224;
     double start_takeoff_land_time;
     ros::Time last_request_time_;
     bool enu_frame_, vel_in_body_;
     Eigen::Vector4d hover_pose_;
+    std::mt19937 command_delay_rng_;
+    std::exponential_distribution<double> command_delay_distribution_;
 
     int line_cnt_ = 0, number_of_steps_ = 0;
     std::vector<std::vector<double>> test_trajectory_;
@@ -102,7 +108,18 @@ private:
         }
     }
 
-    void send_cmd(const Controller_Output_t &output){
+    double sample_command_delay_sec()
+    {
+        double delay_sec;
+        do
+        {
+            delay_sec = command_delay_min_sec_ + command_delay_distribution_(command_delay_rng_);
+        } while (delay_sec > command_delay_max_sec_);
+
+        return delay_sec;
+    }
+
+    void send_cmd(const Controller_Output_t &output, bool add_delay){
         mavros_msgs::AttitudeTarget cmd;
         cmd.header.stamp = ros::Time::now();
         cmd.body_rate.x = output.bodyrates(0);
@@ -110,6 +127,10 @@ private:
         cmd.body_rate.z = output.bodyrates(2);
         cmd.thrust = output.thrust;
         cmd.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ATTITUDE;
+        if (add_delay)
+        {
+            ros::Duration(sample_command_delay_sec()).sleep();
+        }
         cmd_pub_.publish(cmd);
     }
 
@@ -500,7 +521,7 @@ private:
 
         if (send_attitude_cmd_this_cycle_)
         {
-            send_cmd(u);
+            send_cmd(u, exec_traj_state_ == POINTS);
         }
         
         if(state_.mode == mavros_msgs::State::MODE_PX4_OFFBOARD &&
@@ -592,7 +613,9 @@ private:
 	};
 
 public:
-    OMMPC_EXAMPLE(/* args */){};
+    OMMPC_EXAMPLE(/* args */)
+        : command_delay_rng_(std::random_device{}()),
+          command_delay_distribution_(1.0 / (command_delay_mean_sec_ - command_delay_min_sec_)){};
     ~OMMPC_EXAMPLE(){};
     void init(ros::NodeHandle &nh){
         std::string odom_topic;

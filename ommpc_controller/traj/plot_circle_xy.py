@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 
 
@@ -43,26 +44,42 @@ def main():
 
     x = data[:, 0]
     y = data[:, 1]
+    has_velocity = data.shape[1] >= 6
+    speed = None
+    if has_velocity:
+        velocity = data[:, 3:6]
+        speed = np.linalg.norm(velocity, axis=1)
 
     center_x = 0.5 * (np.min(x) + np.max(x))
     center_y = 0.5 * (np.min(y) + np.max(y))
 
-    plt.figure(figsize=(6, 6))
-    plt.plot(x, y, label="trajectory", linewidth=2)
-    plt.scatter(x[0], y[0], color="green", label="start", zorder=3)
-    plt.scatter(x[-1], y[-1], color="red", label="end", zorder=3)
-    plt.scatter(center_x, center_y, color="orange", marker="x", s=80, label="center")
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
-    plt.title(f"x-y trajectory: {traj_path.name}")
-    plt.axis("equal")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(7, 6))
+    if has_velocity and len(x) > 1:
+        points = np.column_stack([x, y]).reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        segment_speed = 0.5 * (speed[:-1] + speed[1:])
+        line = LineCollection(segments, cmap="turbo", linewidth=2.5)
+        line.set_array(segment_speed)
+        ax.add_collection(line)
+        colorbar = fig.colorbar(line, ax=ax, pad=0.02)
+        colorbar.set_label("speed [m/s]")
+    else:
+        ax.plot(x, y, label="trajectory", linewidth=2)
+
+    ax.scatter(x[0], y[0], color="green", label="start", zorder=3)
+    ax.scatter(x[-1], y[-1], color="red", label="end", zorder=3)
+    ax.scatter(center_x, center_y, color="orange", marker="x", s=80, label="center")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title(f"x-y trajectory: {traj_path.name}")
+    ax.axis("equal")
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend()
+    fig.tight_layout()
 
     if args.save is not None:
         save_path = args.save.expanduser().resolve()
-        plt.savefig(save_path, dpi=200)
+        fig.savefig(save_path, dpi=200)
         print(f"Saved plot to {save_path}")
 
     plt.show()
