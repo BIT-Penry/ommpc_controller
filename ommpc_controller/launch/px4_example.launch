@@ -5,7 +5,11 @@
 <!-- Enable/disable the trajectory logger node. -->
 <arg name="enable_logger" default="true" />
 <!-- Logger autosave period in seconds. -->
-<arg name="logger_autosave_period" default="0.5" />
+<arg name="logger_autosave_period" default="10.0" />
+<!-- Logger live sample print period in seconds. Set <= 0 to disable. -->
+<arg name="logger_print_period" default="0.0" />
+<!-- Save plots during autosave snapshots. Final shutdown save still plots. -->
+<arg name="logger_plot_on_autosave" default="false" />
 
 <!-- Main OMMPC controller node. Loads params.yaml and subscribes to odometry. -->
 <node pkg="ommpc_controller" type="ommpc_controller_example_node" name="ommpc_controller" output="screen">
@@ -17,6 +21,8 @@
 <node if="$(arg enable_logger)" pkg="ommpc_controller" type="flight_path_error_logger.py" name="flight_path_error_logger" output="screen">
         <param name="actual_topic" value="$(arg odom_topic)" />
         <param name="autosave_period" value="$(arg logger_autosave_period)" />
+        <param name="print_period" value="$(arg logger_print_period)" />
+        <param name="plot_on_autosave" value="$(arg logger_plot_on_autosave)" />
 	</node>
 
 <!-- GUI for toggling takeoff / hover / landing related dynamic reconfigure options. -->

@@ -67,15 +67,19 @@ class FlightPathErrorLogger:
         self.default_params_yaml = os.path.join(self.package_dir, "config", "params.yaml")
 
         self.params_yaml = rospy.get_param("~params_yaml", self.default_params_yaml)
-        self.output_root = rospy.get_param("~output_root", os.path.join(self.package_dir, "logs"))
+        self.output_root = rospy.get_param(
+            "~output_root",
+            os.path.join(self.package_dir, "logs", "traj_track_step"),
+        )
         self.actual_topic = rospy.get_param(
             "~actual_topic",
             rospy.get_param("/ommpc_controller/odom_topic", "/some_object_name_vrpn_client/estimated_odometry"),
         )
         self.gt_topic = rospy.get_param("~gt_topic", "")
         self.gt_max_dt = float(rospy.get_param("~gt_max_dt", 0.05))
-        self.print_period = float(rospy.get_param("~print_period", 1.0))
-        self.autosave_period = float(rospy.get_param("~autosave_period", 0.5))
+        self.print_period = float(rospy.get_param("~print_period", 0.0))
+        self.autosave_period = float(rospy.get_param("~autosave_period", 10.0))
+        self.plot_on_autosave = bool(rospy.get_param("~plot_on_autosave", False))
         self.start_trigger = rospy.get_param("~start_trigger", "first_odom")
         self.motion_threshold = float(rospy.get_param("~motion_threshold", 0.05))
         self.use_text_reference = bool(rospy.get_param("~use_text_reference", True))
@@ -493,7 +497,7 @@ class FlightPathErrorLogger:
                         "vel_err_xyz": vel_err_xyz,
                     })
 
-        if stamp - self.last_print_time >= self.print_period:
+        if self.print_period > 0.0 and stamp - self.last_print_time >= self.print_period:
             self.last_print_time = stamp
             self._print_live_status()
         if self.autosave_period > 0.0 and stamp - self.last_autosave_time >= self.autosave_period:
@@ -742,7 +746,8 @@ class FlightPathErrorLogger:
                 ],
             )
 
-        self._plot_3d_and_error(self.fig_png_path)
+        if final or self.plot_on_autosave:
+            self._plot_3d_and_error(self.fig_png_path)
         self._save_summary(self.summary_txt_path)
         if final:
             rospy.loginfo("[flight_path_error_logger] Final outputs saved to %s", self.out_dir)
