@@ -1,7 +1,8 @@
 <launch>
 
 <!-- Odometry topic used by both the controller and the logger. -->
-<arg name="odom_topic" default="/some_object_name_vrpn_client/estimated_odometry" />
+<!-- <arg name="odom_topic" default="/some_object_name_vrpn_client/estimated_odometry" /> -->
+<arg name="odom_topic" default="/mavros/local_position/odom" />
 <!-- Enable/disable the trajectory logger node. -->
 <arg name="enable_logger" default="true" />
 <!-- Logger autosave period in seconds. -->

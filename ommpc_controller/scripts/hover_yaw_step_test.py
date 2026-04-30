@@ -44,12 +44,6 @@ def _series_stats(values):
     }
 
 
-def _parse_targets_deg(value):
-    if isinstance(value, str):
-        return [float(x.strip()) for x in value.split(",") if x.strip()]
-    return [float(x) for x in value]
-
-
 class HoverYawStepTest:
     def __init__(self):
         rospy.init_node("hover_yaw_step_test")
@@ -62,15 +56,10 @@ class HoverYawStepTest:
             "~odom_topic",
             rospy.get_param("/ommpc_controller/odom_topic", "/some_object_name_vrpn_client/estimated_odometry"),
         )
-        self.targets_deg = _parse_targets_deg(
-            rospy.get_param("~targets_deg", [60, 120, 180, 240, 300, 360])
-        )
-        self.dwell_time = float(rospy.get_param("~dwell_time", 10.0))
+        self.targets_deg = [15.0]
+        self.dwell_time = float(rospy.get_param("~dwell_time", 5.0))
         self.start_delay = float(rospy.get_param("~start_delay", 2.0))
-        self.mode = str(rospy.get_param("~mode", "ramp")).strip().lower()
-        if self.mode not in ("step", "ramp"):
-            rospy.logwarn("[hover_yaw_step_test] Unknown mode=%s, falling back to ramp.", self.mode)
-            self.mode = "ramp"
+        self.mode = "step"
         self.pub_hz = float(rospy.get_param("~pub_hz", 20.0))
         self.max_yaw_rate_deg_s = float(rospy.get_param("~max_yaw_rate_deg_s", 15.0))
         self.command_repeat = int(rospy.get_param("~command_repeat", 3))
