@@ -2,9 +2,9 @@ takeoff_height: 1.0
 takeoff_land_speed: 0.2
 
 ref_txt:
-    enable: false
+    enable: true
     time_step: 0.01
-    ref_filename: "/traj/circle.txt"
+    ref_filename: "/traj/trajectory.txt"
 
 # hover_percentage: 0.705
 hover_percentage: 0.2
