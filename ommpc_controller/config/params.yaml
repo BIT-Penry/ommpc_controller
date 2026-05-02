@@ -2,7 +2,7 @@ takeoff_height: 1.0
 takeoff_land_speed: 0.2
 
 ref_txt:
-    enable: true
+    enable: false
     time_step: 0.01
     ref_filename: "/traj/trajectory.txt"
 

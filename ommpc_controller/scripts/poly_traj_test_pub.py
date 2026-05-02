@@ -15,16 +15,8 @@ from nav_msgs.msg import Odometry
 from traj_utils.msg import PolyTraj
 
 
-def _v_add(a, b):
-    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
-
-
 def _v_sub(a, b):
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-
-def _v_mul(a, s):
-    return (a[0] * s, a[1] * s, a[2] * s)
 
 
 def _v_norm(a):
@@ -48,89 +40,85 @@ def _wait_for_valid_ros_time(timeout):
     return not rospy.is_shutdown()
 
 
-def _hermite_cubic_coeff(p0, v0, p1, v1, dt):
+def _eval_low_order(coeffs, tau):
+    return sum(c * (tau ** i) for i, c in enumerate(coeffs))
+
+
+def _eval_low_order_derivative(coeffs, tau):
+    return sum(i * c * (tau ** (i - 1)) for i, c in enumerate(coeffs) if i > 0)
+
+
+def _single_axis_normalized_coeffs(p0, pm, p1, mid_fraction):
+    smoothstep = [0.0] * 8
+    smoothstep[4] = 35.0
+    smoothstep[5] = -84.0
+    smoothstep[6] = 70.0
+    smoothstep[7] = -20.0
+
+    bump = [0.0] * 8
+    bump[3] = 1.0
+    bump[4] = -3.0
+    bump[5] = 3.0
+    bump[6] = -1.0
+
+    base_mid = p0 + (p1 - p0) * _eval_low_order(smoothstep, mid_fraction)
+    bump_mid = _eval_low_order(bump, mid_fraction)
+    if abs(bump_mid) < 1.0e-9:
+        raise ValueError("mid_fraction is too close to an endpoint")
+
+    bump_gain = (pm - base_mid) / bump_mid
+    normalized = [0.0] * 8
+    normalized[0] = p0
+    for i in range(8):
+        normalized[i] += (p1 - p0) * smoothstep[i] + bump_gain * bump[i]
+
+    return normalized
+
+
+def _single_axis_seventh_coeffs(p0, pm, p1, mid_fraction, duration):
     """
-    Cubic Hermite in local segment time t in [0, dt]:
-      p(t) = a3*t^3 + a2*t^2 + a1*t + a0
+    Build p(t) from a 7th-order smoothstep plus a zero-end-velocity/acceleration
+    bump, with p(mid_fraction * duration) = pm.
+    Coefficients are returned high-order first for PolyTraj.
     """
-    dp = _v_sub(p1, p0)
-    inv_t = 1.0 / dt
-    inv_t2 = inv_t * inv_t
-    inv_t3 = inv_t2 * inv_t
-
-    a0 = p0
-    a1 = v0
-    a2 = _v_sub(_v_mul(dp, 3.0 * inv_t2), _v_mul(_v_add(_v_mul(v0, 2.0), v1), inv_t))
-    a3 = _v_add(_v_mul(dp, -2.0 * inv_t3), _v_mul(_v_add(v0, v1), inv_t2))
-    return a3, a2, a1, a0
+    normalized = _single_axis_normalized_coeffs(p0, pm, p1, mid_fraction)
+    return [normalized[i] / (duration ** i) for i in range(7, -1, -1)]
 
 
-def _estimate_tangents(points, durations):
-    # Endpoints set to zero velocity to avoid sudden starts from hover.
-    n = len(points)
-    tangents = [(0.0, 0.0, 0.0) for _ in range(n)]
-    if n <= 2:
-        return tangents
-
-    for i in range(1, n - 1):
-        dt_prev = max(durations[i - 1], 1.0e-3)
-        dt_next = max(durations[i], 1.0e-3)
-        v_prev = _v_mul(_v_sub(points[i], points[i - 1]), 1.0 / dt_prev)
-        v_next = _v_mul(_v_sub(points[i + 1], points[i]), 1.0 / dt_next)
-        tangents[i] = _v_mul(_v_add(v_prev, v_next), 0.5)
-    return tangents
-
-
-def _build_default_waypoints(num_segments):
-    # Build a smooth S-like path with configurable segment count.
-    # Number of waypoints = num_segments + 1.
-    n = max(1, int(num_segments))
-    length = 3.5
-    points = []
-    for i in range(n + 1):
-        s = float(i) / float(n)  # normalized path progress [0, 1]
-        x = length * s
-        y = 0.55 * math.sin(2.0 * math.pi * s) + 0.12 * math.sin(4.0 * math.pi * s)
-        z = 1.0 + 0.12 * math.sin(math.pi * s)
-        points.append((x, y, z))
-    return points
+def _build_duration(start, mid, end, mid_fraction, cruise_speed, min_duration):
+    normalized_coeffs = [
+        _single_axis_normalized_coeffs(start[i], mid[i], end[i], mid_fraction)
+        for i in range(3)
+    ]
+    max_norm_speed = 0.0
+    for k in range(1001):
+        tau = k / 1000.0
+        vx = _eval_low_order_derivative(normalized_coeffs[0], tau)
+        vy = _eval_low_order_derivative(normalized_coeffs[1], tau)
+        vz = _eval_low_order_derivative(normalized_coeffs[2], tau)
+        max_norm_speed = max(max_norm_speed, _v_norm((vx, vy, vz)))
+    return max(max_norm_speed / max(float(cruise_speed), 0.05), float(min_duration))
 
 
-def _build_durations(points, cruise_speed, min_duration):
-    durations = []
-    for i in range(len(points) - 1):
-        dist = _v_norm(_v_sub(points[i + 1], points[i]))
-        dt = max(dist / max(cruise_speed, 0.05), min_duration)
-        durations.append(dt)
-    return durations
-
-
-def make_multi_segment_msg(traj_id, start_delay, cruise_speed, min_duration, num_segments):
+def make_single_segment_msg(traj_id, start_delay, cruise_speed, min_duration):
     msg = PolyTraj()
     msg.drone_id = 0
     msg.traj_id = traj_id
     msg.start_time = rospy.Time.now() + rospy.Duration.from_sec(start_delay)
-    msg.order = 3
+    msg.order = 7
 
-    points = _build_default_waypoints(num_segments=num_segments)
-    durations = _build_durations(points, cruise_speed=cruise_speed, min_duration=min_duration)
-    tangents = _estimate_tangents(points, durations)
+    start = (0.0, 0.0, 1.0)
+    mid = (2.0, 0.2, 1.2)
+    end = (3.5, 0.0, 1.0)
+    mid_fraction = 0.5
+    duration = _build_duration(start, mid, end, mid_fraction, cruise_speed, min_duration)
 
-    coef_x = []
-    coef_y = []
-    coef_z = []
-    for i, dt in enumerate(durations):
-        a3, a2, a1, a0 = _hermite_cubic_coeff(points[i], tangents[i], points[i + 1], tangents[i + 1], dt)
-        # poly convention in this repo:
-        # p(t) = c0*t^order + c1*t^(order-1) + ... + c(order), order=3.
-        coef_x.extend([a3[0], a2[0], a1[0], a0[0]])
-        coef_y.extend([a3[1], a2[1], a1[1], a0[1]])
-        coef_z.extend([a3[2], a2[2], a1[2], a0[2]])
-
-    msg.duration = durations
-    msg.coef_x = coef_x
-    msg.coef_y = coef_y
-    msg.coef_z = coef_z
+    # PolyTraj convention in this repo:
+    # p(t) = c0*t^order + c1*t^(order-1) + ... + c(order).
+    msg.duration = [duration]
+    msg.coef_x = _single_axis_seventh_coeffs(start[0], mid[0], end[0], mid_fraction, duration)
+    msg.coef_y = _single_axis_seventh_coeffs(start[1], mid[1], end[1], mid_fraction, duration)
+    msg.coef_z = _single_axis_seventh_coeffs(start[2], mid[2], end[2], mid_fraction, duration)
     return msg
 
 
@@ -390,9 +378,8 @@ def main():
 
     topic = rospy.get_param("~topic", "/drone_0_planning/trajectory")
     start_delay = rospy.get_param("~start_delay", 1.0)
-    cruise_speed = rospy.get_param("~cruise_speed", 0.8)
+    cruise_speed = rospy.get_param("~cruise_speed", 1.5)
     min_duration = rospy.get_param("~min_duration", 1.0)
-    num_segments = rospy.get_param("~num_segments", 7)
     pub_hz = rospy.get_param("~pub_hz", 1.0)
     publish_once = rospy.get_param("~publish_once", True)
     hold_node_alive = rospy.get_param("~hold_node_alive", True)
@@ -404,21 +391,19 @@ def main():
         return
 
     pub = rospy.Publisher(topic, PolyTraj, queue_size=10, latch=True)
-    msg = make_multi_segment_msg(
+    msg = make_single_segment_msg(
         traj_id=traj_id,
         start_delay=start_delay,
         cruise_speed=cruise_speed,
         min_duration=min_duration,
-        num_segments=num_segments,
     )
 
     rospy.loginfo("[poly_traj_test_pub] Publishing to %s", topic)
     rospy.loginfo(
-        "[poly_traj_test_pub] Params: start_delay=%.2f, speed=%.2f, min_duration=%.2f, num_segments=%d, pub_hz=%.2f, publish_once=%s",
+        "[poly_traj_test_pub] Params: start_delay=%.2f, speed=%.2f, min_duration=%.2f, pub_hz=%.2f, publish_once=%s",
         start_delay,
         cruise_speed,
         min_duration,
-        int(num_segments),
         pub_hz,
         str(publish_once),
     )
