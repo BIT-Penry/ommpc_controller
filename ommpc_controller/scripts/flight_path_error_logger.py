@@ -71,6 +71,14 @@ class FlightPathErrorLogger:
             "~output_root",
             os.path.join(self.package_dir, "logs", "traj_track_step"),
         )
+        self.shared_log_dir_param = rospy.get_param(
+            "~shared_log_dir_param",
+            "/ommpc_controller/traj_track_log_dir",
+        )
+        self.shared_log_run_id_param = rospy.get_param(
+            "~shared_log_run_id_param",
+            "/ommpc_controller/traj_track_run_id",
+        )
         self.actual_topic = rospy.get_param(
             "~actual_topic",
             rospy.get_param("/ommpc_controller/odom_topic", "/some_object_name_vrpn_client/estimated_odometry"),
@@ -124,6 +132,8 @@ class FlightPathErrorLogger:
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.out_dir = os.path.join(self.output_root, self.run_id)
         os.makedirs(self.out_dir, exist_ok=True)
+        rospy.set_param(self.shared_log_dir_param, self.out_dir)
+        rospy.set_param(self.shared_log_run_id_param, self.run_id)
         self.actual_csv_path = os.path.join(self.out_dir, "actual_path.csv")
         self.gt_csv_path = os.path.join(self.out_dir, "actual_vs_gt.csv")
         self.ref_csv_path = os.path.join(self.out_dir, "actual_vs_txt_ref.csv")

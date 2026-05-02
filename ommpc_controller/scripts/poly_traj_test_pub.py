@@ -4,6 +4,7 @@
 import csv
 import math
 import os
+import time
 from datetime import datetime
 
 import matplotlib
@@ -28,6 +29,23 @@ def _v_mul(a, s):
 
 def _v_norm(a):
     return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _wait_for_valid_ros_time(timeout):
+    start_wall = time.time()
+    rate = rospy.Rate(100.0)
+    warned = False
+    while not rospy.is_shutdown() and rospy.Time.now().to_sec() <= 1.0e-6:
+        if timeout > 0.0 and time.time() - start_wall > timeout:
+            rospy.logwarn(
+                "[poly_traj_test_pub] Timed out waiting for valid ROS time; trajectory start_time may be invalid."
+            )
+            return False
+        if not warned:
+            rospy.loginfo("[poly_traj_test_pub] Waiting for valid ROS time before building trajectory...")
+            warned = True
+        rate.sleep()
+    return not rospy.is_shutdown()
 
 
 def _hermite_cubic_coeff(p0, v0, p1, v1, dt):
@@ -67,13 +85,13 @@ def _build_default_waypoints(num_segments):
     # Build a smooth S-like path with configurable segment count.
     # Number of waypoints = num_segments + 1.
     n = max(1, int(num_segments))
-    length = 4.9
+    length = 3.5
     points = []
     for i in range(n + 1):
         s = float(i) / float(n)  # normalized path progress [0, 1]
         x = length * s
         y = 0.55 * math.sin(2.0 * math.pi * s) + 0.12 * math.sin(4.0 * math.pi * s)
-        z = 0.85 + 0.12 * math.sin(math.pi * s)
+        z = 1.0 + 0.12 * math.sin(math.pi * s)
         points.append((x, y, z))
     return points
 
@@ -119,8 +137,20 @@ def make_multi_segment_msg(traj_id, start_delay, cruise_speed, min_duration, num
 class CompareRecorder:
     def __init__(self, msg):
         self.msg = msg
-        self.odom_topic = rospy.get_param("~odom_topic", "/some_object_name_vrpn_client/estimated_odometry")
-        self.output_root = rospy.get_param("~output_root", "/tmp/ommpc_poly_compare")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        package_dir = os.path.dirname(script_dir)
+        self.odom_topic = rospy.get_param(
+            "~odom_topic",
+            rospy.get_param("/ommpc_controller/odom_topic", "/some_object_name_vrpn_client/estimated_odometry"),
+        )
+        self.output_root = rospy.get_param(
+            "~output_root",
+            os.path.join(package_dir, "logs", "traj_track_step"),
+        )
+        self.shared_log_dir_param = rospy.get_param(
+            "~shared_log_dir_param",
+            "/ommpc_controller/traj_track_log_dir",
+        )
         self.ref_sample_dt = float(rospy.get_param("~ref_sample_dt", 0.02))
         self.max_follow_time = float(rospy.get_param("~max_follow_time", 30.0))
         self.capture_before_start = bool(rospy.get_param("~capture_before_start", False))
@@ -220,6 +250,56 @@ class CompareRecorder:
             writer.writerow(header)
             writer.writerows(rows)
 
+    def _resolve_out_dir(self):
+        shared_out_dir = rospy.get_param(self.shared_log_dir_param, "")
+        if shared_out_dir:
+            return shared_out_dir
+        return os.path.join(self.output_root, datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    def _combined_rows(self):
+        rows = []
+        if self.actual_samples:
+            for r in self.actual_samples:
+                err_x = r[4] - r[1]
+                err_y = r[5] - r[2]
+                err_z = r[6] - r[3]
+                err_xy = math.sqrt(err_x * err_x + err_y * err_y)
+                err_xyz = math.sqrt(err_x * err_x + err_y * err_y + err_z * err_z)
+                rows.append([
+                    "actual_vs_reference",
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[6],
+                    err_x,
+                    err_y,
+                    err_z,
+                    err_xy,
+                    err_xyz,
+                ])
+            return rows
+
+        for r in self.ref_samples:
+            rows.append([
+                "reference",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ])
+        return rows
+
     def _plot(self, path):
         if not self.actual_samples:
             return
@@ -277,19 +357,30 @@ class CompareRecorder:
         if not self.ref_samples and not self.actual_samples:
             rospy.loginfo("[poly_traj_test_pub] No comparison samples captured.")
             return
-        out_dir = os.path.join(self.output_root, datetime.now().strftime("%Y%m%d_%H%M%S"))
+        out_dir = self._resolve_out_dir()
         os.makedirs(out_dir, exist_ok=True)
-        ref_csv = os.path.join(out_dir, "reference_samples.csv")
-        cmp_csv = os.path.join(out_dir, "actual_vs_reference_samples.csv")
+        samples_csv = os.path.join(out_dir, "traj_track_samples.csv")
         fig_png = os.path.join(out_dir, "compare_plot.png")
-        if self.ref_samples:
-            self._write_csv(ref_csv, ["t_ref_s", "ref_x", "ref_y", "ref_z"], self.ref_samples)
+        self._write_csv(
+            samples_csv,
+            [
+                "sample_type",
+                "t_s",
+                "ref_x",
+                "ref_y",
+                "ref_z",
+                "actual_x",
+                "actual_y",
+                "actual_z",
+                "pos_err_x",
+                "pos_err_y",
+                "pos_err_z",
+                "pos_err_xy",
+                "pos_err_xyz",
+            ],
+            self._combined_rows(),
+        )
         if self.actual_samples:
-            self._write_csv(
-                cmp_csv,
-                ["t_s", "ref_x", "ref_y", "ref_z", "actual_x", "actual_y", "actual_z"],
-                self.actual_samples,
-            )
             self._plot(fig_png)
         rospy.loginfo("[poly_traj_test_pub] Compare outputs saved to %s", out_dir)
 
@@ -298,7 +389,7 @@ def main():
     rospy.init_node("poly_traj_test_pub")
 
     topic = rospy.get_param("~topic", "/drone_0_planning/trajectory")
-    start_delay = rospy.get_param("~start_delay", 0.5)
+    start_delay = rospy.get_param("~start_delay", 1.0)
     cruise_speed = rospy.get_param("~cruise_speed", 0.8)
     min_duration = rospy.get_param("~min_duration", 1.0)
     num_segments = rospy.get_param("~num_segments", 7)
@@ -307,6 +398,10 @@ def main():
     hold_node_alive = rospy.get_param("~hold_node_alive", True)
     traj_id = rospy.get_param("~traj_id", 1)
     enable_compare = rospy.get_param("~enable_compare", True)
+    time_wait_timeout = float(rospy.get_param("~time_wait_timeout", 5.0))
+
+    if not _wait_for_valid_ros_time(time_wait_timeout):
+        return
 
     pub = rospy.Publisher(topic, PolyTraj, queue_size=10, latch=True)
     msg = make_multi_segment_msg(

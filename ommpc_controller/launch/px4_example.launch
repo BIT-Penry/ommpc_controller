@@ -11,6 +11,8 @@
 <arg name="logger_print_period" default="0.0" />
 <!-- Save plots during autosave snapshots. Final shutdown save still plots. -->
 <arg name="logger_plot_on_autosave" default="false" />
+<!-- Directory used by trajectory tracking loggers. -->
+<arg name="traj_track_log_root" default="$(find ommpc_controller)/logs/traj_track_step" />
 
 <!-- Main OMMPC controller node. Loads params.yaml and subscribes to odometry. -->
 <node pkg="ommpc_controller" type="ommpc_controller_example_node" name="ommpc_controller" output="screen">
@@ -24,7 +26,8 @@
         <param name="autosave_period" value="$(arg logger_autosave_period)" />
         <param name="print_period" value="$(arg logger_print_period)" />
         <param name="plot_on_autosave" value="$(arg logger_plot_on_autosave)" />
-	</node>
+        <param name="output_root" value="$(arg traj_track_log_root)" />
+		</node>
 
 <!-- GUI for toggling takeoff / hover / landing related dynamic reconfigure options. -->
 <node pkg="rqt_reconfigure" type="rqt_reconfigure" name="rqt_reconfigure">
