@@ -15,12 +15,15 @@ from nav_msgs.msg import Odometry
 from traj_utils.msg import PolyTraj
 
 
-def _v_sub(a, b):
-    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-
 def _v_norm(a):
     return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _falling_factorial(power, count):
+    value = 1.0
+    for k in range(count):
+        value *= power - k
+    return value
 
 
 def _wait_for_valid_ros_time(timeout):
@@ -40,54 +43,103 @@ def _wait_for_valid_ros_time(timeout):
     return not rospy.is_shutdown()
 
 
-def _eval_low_order(coeffs, tau):
-    return sum(c * (tau ** i) for i, c in enumerate(coeffs))
-
-
 def _eval_low_order_derivative(coeffs, tau):
     return sum(i * c * (tau ** (i - 1)) for i, c in enumerate(coeffs) if i > 0)
 
 
-def _single_axis_normalized_coeffs(p0, pm, p1, mid_fraction):
-    smoothstep = [0.0] * 8
-    smoothstep[4] = 35.0
-    smoothstep[5] = -84.0
-    smoothstep[6] = 70.0
-    smoothstep[7] = -20.0
+def _derivative_basis(order, derivative_order, t):
+    basis = []
+    for power in range(order + 1):
+        if power < derivative_order:
+            basis.append(0.0)
+        else:
+            basis.append(_falling_factorial(power, derivative_order) * (t ** (power - derivative_order)))
+    return basis
 
-    bump = [0.0] * 8
-    bump[3] = 1.0
-    bump[4] = -3.0
-    bump[5] = 3.0
-    bump[6] = -1.0
 
-    base_mid = p0 + (p1 - p0) * _eval_low_order(smoothstep, mid_fraction)
-    bump_mid = _eval_low_order(bump, mid_fraction)
-    if abs(bump_mid) < 1.0e-9:
+def _solve_linear_system(matrix, rhs):
+    n = len(rhs)
+    aug = [list(map(float, matrix[i])) + [float(rhs[i])] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda row: abs(aug[row][col]))
+        if abs(aug[pivot][col]) < 1.0e-12:
+            raise ValueError("minimum-snap KKT system is singular")
+        if pivot != col:
+            aug[col], aug[pivot] = aug[pivot], aug[col]
+
+        pivot_value = aug[col][col]
+        for j in range(col, n + 1):
+            aug[col][j] /= pivot_value
+
+        for row in range(n):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if abs(factor) < 1.0e-15:
+                continue
+            for j in range(col, n + 1):
+                aug[row][j] -= factor * aug[col][j]
+
+    return [aug[i][n] for i in range(n)]
+
+
+def _single_axis_min_snap_normalized_coeffs(p0, pm, p1, mid_fraction):
+    """
+    Minimize integral snap^2 for q(tau), tau in [0, 1], subject to:
+    q(0)=p0, q'(0)=0, q''(0)=0, q(mid_fraction)=pm,
+    q(1)=p1, q'(1)=0, q''(1)=0.
+    Coefficients are returned low-order first.
+    """
+    if mid_fraction <= 1.0e-6 or mid_fraction >= 1.0 - 1.0e-6:
         raise ValueError("mid_fraction is too close to an endpoint")
 
-    bump_gain = (pm - base_mid) / bump_mid
-    normalized = [0.0] * 8
-    normalized[0] = p0
-    for i in range(8):
-        normalized[i] += (p1 - p0) * smoothstep[i] + bump_gain * bump[i]
+    order = 7
+    num_coeff = order + 1
+    snap_order = 4
 
-    return normalized
+    hessian = [[0.0 for _ in range(num_coeff)] for _ in range(num_coeff)]
+    for i in range(snap_order, num_coeff):
+        di = _falling_factorial(i, snap_order)
+        for j in range(snap_order, num_coeff):
+            dj = _falling_factorial(j, snap_order)
+            hessian[i][j] = 2.0 * di * dj / (i + j - 2 * snap_order + 1)
+
+    constraints = [
+        (_derivative_basis(order, 0, 0.0), p0),
+        (_derivative_basis(order, 1, 0.0), 0.0),
+        (_derivative_basis(order, 2, 0.0), 0.0),
+        (_derivative_basis(order, 0, mid_fraction), pm),
+        (_derivative_basis(order, 0, 1.0), p1),
+        (_derivative_basis(order, 1, 1.0), 0.0),
+        (_derivative_basis(order, 2, 1.0), 0.0),
+    ]
+    num_constraints = len(constraints)
+
+    kkt = []
+    rhs = []
+    for i in range(num_coeff):
+        kkt.append(hessian[i] + [row[i] for row, _ in constraints])
+        rhs.append(0.0)
+    for row, value in constraints:
+        kkt.append(row + [0.0] * num_constraints)
+        rhs.append(value)
+
+    return _solve_linear_system(kkt, rhs)[:num_coeff]
 
 
-def _single_axis_seventh_coeffs(p0, pm, p1, mid_fraction, duration):
+def _single_axis_min_snap_seventh_coeffs(p0, pm, p1, mid_fraction, duration):
     """
-    Build p(t) from a 7th-order smoothstep plus a zero-end-velocity/acceleration
-    bump, with p(mid_fraction * duration) = pm.
+    Build a single 7th-order minimum-snap p(t) with zero start/end
+    velocity and acceleration, and p(mid_fraction * duration) = pm.
     Coefficients are returned high-order first for PolyTraj.
     """
-    normalized = _single_axis_normalized_coeffs(p0, pm, p1, mid_fraction)
+    normalized = _single_axis_min_snap_normalized_coeffs(p0, pm, p1, mid_fraction)
     return [normalized[i] / (duration ** i) for i in range(7, -1, -1)]
 
 
 def _build_duration(start, mid, end, mid_fraction, cruise_speed, min_duration):
     normalized_coeffs = [
-        _single_axis_normalized_coeffs(start[i], mid[i], end[i], mid_fraction)
+        _single_axis_min_snap_normalized_coeffs(start[i], mid[i], end[i], mid_fraction)
         for i in range(3)
     ]
     max_norm_speed = 0.0
@@ -116,9 +168,9 @@ def make_single_segment_msg(traj_id, start_delay, cruise_speed, min_duration):
     # PolyTraj convention in this repo:
     # p(t) = c0*t^order + c1*t^(order-1) + ... + c(order).
     msg.duration = [duration]
-    msg.coef_x = _single_axis_seventh_coeffs(start[0], mid[0], end[0], mid_fraction, duration)
-    msg.coef_y = _single_axis_seventh_coeffs(start[1], mid[1], end[1], mid_fraction, duration)
-    msg.coef_z = _single_axis_seventh_coeffs(start[2], mid[2], end[2], mid_fraction, duration)
+    msg.coef_x = _single_axis_min_snap_seventh_coeffs(start[0], mid[0], end[0], mid_fraction, duration)
+    msg.coef_y = _single_axis_min_snap_seventh_coeffs(start[1], mid[1], end[1], mid_fraction, duration)
+    msg.coef_z = _single_axis_min_snap_seventh_coeffs(start[2], mid[2], end[2], mid_fraction, duration)
     return msg
 
 
@@ -378,7 +430,7 @@ def main():
 
     topic = rospy.get_param("~topic", "/drone_0_planning/trajectory")
     start_delay = rospy.get_param("~start_delay", 1.0)
-    cruise_speed = rospy.get_param("~cruise_speed", 1.5)
+    cruise_speed = rospy.get_param("~cruise_speed", 1.0)
     min_duration = rospy.get_param("~min_duration", 1.0)
     pub_hz = rospy.get_param("~pub_hz", 1.0)
     publish_once = rospy.get_param("~publish_once", True)
