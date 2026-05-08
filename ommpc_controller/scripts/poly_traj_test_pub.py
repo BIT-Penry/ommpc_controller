@@ -9,6 +9,7 @@ from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib.collections import LineCollection
 import matplotlib.pyplot as plt
 import rospy
 from nav_msgs.msg import Odometry
@@ -160,8 +161,8 @@ def make_single_segment_msg(traj_id, start_delay, cruise_speed, min_duration):
     msg.order = 7
 
     start = (0.0, 0.0, 1.0)
-    mid = (2.0, 0.2, 1.2)
-    end = (3.5, 0.0, 1.0)
+    mid = (5.0, 0.5, 1.2)
+    end = (10.0, 0.0, 1.0)
     mid_fraction = 0.5
     duration = _build_duration(start, mid, end, mid_fraction, cruise_speed, min_duration)
 
@@ -282,7 +283,18 @@ class CompareRecorder:
         if ref_xyz is None:
             return
         p = odom.pose.pose.position
-        self.actual_samples.append([rel_t, ref_xyz[0], ref_xyz[1], ref_xyz[2], p.x, p.y, p.z])
+        v = odom.twist.twist.linear
+        speed = _v_norm((v.x, v.y, v.z))
+        self.actual_samples.append([
+            rel_t,
+            ref_xyz[0],
+            ref_xyz[1],
+            ref_xyz[2],
+            p.x,
+            p.y,
+            p.z,
+            speed,
+        ])
 
     def _write_csv(self, path, header, rows):
         with open(path, "w", newline="") as f:
@@ -314,6 +326,7 @@ class CompareRecorder:
                     r[4],
                     r[5],
                     r[6],
+                    r[7],
                     err_x,
                     err_y,
                     err_z,
@@ -337,6 +350,7 @@ class CompareRecorder:
                 "",
                 "",
                 "",
+                "",
             ])
         return rows
 
@@ -350,11 +364,46 @@ class CompareRecorder:
         ax = [r[4] for r in self.actual_samples]
         ay = [r[5] for r in self.actual_samples]
         az = [r[6] for r in self.actual_samples]
+        actual_speed = [r[7] for r in self.actual_samples]
 
         fig = plt.figure(figsize=(12, 8))
         p1 = fig.add_subplot(2, 2, 1)
         p1.plot(rx, ry, "b-", label="reference")
-        p1.plot(ax, ay, "r-", label="actual")
+        speed_artist = None
+        if len(ax) >= 2:
+            segments = [
+                [(ax[i], ay[i]), (ax[i + 1], ay[i + 1])]
+                for i in range(len(ax) - 1)
+            ]
+            segment_speed = [
+                0.5 * (actual_speed[i] + actual_speed[i + 1])
+                for i in range(len(actual_speed) - 1)
+            ]
+            speed_max = max(segment_speed)
+            if speed_max <= 1.0e-9:
+                speed_max = 1.0
+            speed_artist = LineCollection(segments, cmap="plasma", linewidths=2.0)
+            speed_artist.set_array(segment_speed)
+            speed_artist.set_clim(0.0, speed_max)
+            p1.add_collection(speed_artist)
+            p1.plot([], [], color="tab:orange", linewidth=2.0, label="actual speed")
+        else:
+            speed_max = max(actual_speed)
+            if speed_max <= 1.0e-9:
+                speed_max = 1.0
+            speed_artist = p1.scatter(
+                ax,
+                ay,
+                c=actual_speed,
+                cmap="plasma",
+                s=20,
+                label="actual speed",
+                vmin=0.0,
+                vmax=speed_max,
+            )
+        if speed_artist is not None:
+            cbar = fig.colorbar(speed_artist, ax=p1, pad=0.02)
+            cbar.set_label("actual speed [m/s]")
         p1.set_title("XY trajectory")
         p1.set_xlabel("x [m]")
         p1.set_ylabel("y [m]")
@@ -412,6 +461,7 @@ class CompareRecorder:
                 "actual_x",
                 "actual_y",
                 "actual_z",
+                "actual_speed",
                 "pos_err_x",
                 "pos_err_y",
                 "pos_err_z",
@@ -430,7 +480,7 @@ def main():
 
     topic = rospy.get_param("~topic", "/drone_0_planning/trajectory")
     start_delay = rospy.get_param("~start_delay", 1.0)
-    cruise_speed = rospy.get_param("~cruise_speed", 1.0)
+    cruise_speed = rospy.get_param("~cruise_speed", 5.0)
     min_duration = rospy.get_param("~min_duration", 1.0)
     pub_hz = rospy.get_param("~pub_hz", 1.0)
     publish_once = rospy.get_param("~publish_once", True)
